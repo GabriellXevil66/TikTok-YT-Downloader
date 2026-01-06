@@ -1,32 +1,41 @@
 import os
-import re
-import requests
 import asyncio
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    filters,
+)
+from yt_dlp import YoutubeDL
 from deep_translator import GoogleTranslator
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ====== FUNCTIONS ======
-def resolve_tiktok_short(url: str) -> str:
-    try:
-        r = requests.head(url, allow_redirects=True, timeout=5)
-        return r.url
-    except:
-        return url
+# ===== YOUTUBE CONFIG =====
+YDL_VIDEO_OPTS = {
+    "format": "bestvideo[height<=720]+bestaudio/best",
+    "outtmpl": "video.%(ext)s",
+    "merge_output_format": "mp4",
+    "quiet": True,
+    "nocheckcertificate": True,
+}
+
+YDL_INFO_OPTS = {"quiet": True, "skip_download": True, "nocheckcertificate": True}
+
+# ===== FUNCTIONS =====
 
 async def extract_caption(url: str) -> str:
-    # TikTok caption (basic) atau YouTube title
+    # TikTok caption  (ambil judul halaman)
     if "tiktok.com" in url or "vt.tiktok.com" in url:
-        # TikTok API basic
-        return "🎵 Video TikTok"
-    try:
-        res = requests.get(url, timeout=5)
-        title_match = re.search(r"<title>(.*?)</title>", res.text)
-        return title_match.group(1) if title_match else "❌ Caption tidak ditemukan"
-    except:
-        return "❌ Caption tidak ditemukan"
+        return "🎵 TikTok Video"
+    def run():
+        with YoutubeDL(YDL_INFO_OPTS) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("description") or info.get("title") or "❌ Tidak ada caption"
+    return await asyncio.to_thread(run)
 
 def translate(text: str) -> str:
     try:
@@ -34,35 +43,24 @@ def translate(text: str) -> str:
     except:
         return text
 
-# ====== DOWNLOAD FUNCTIONS ======
-# YouTube via SaveFrom
-def download_youtube(url: str) -> str:
-    try:
-        if "youtu" not in url:
-            return None
-        vid_id = re.search(r"(?:v=|youtu\.be/)([\w-]+)", url).group(1)
-        res = requests.get(f"https://ssyoutube.com/watch?v={vid_id}", timeout=10)
-        match = re.search(r'href="(https://[^"]+\.mp4)"', res.text)
-        if match:
-            video_url = match.group(1)
-            file_path = "video.mp4"
-            with requests.get(video_url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                with open(file_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        f.write(chunk)
-            return file_path
-        return None
-    except:
-        return None
+async def download_youtube(url: str) -> str:
+    def run():
+        with YoutubeDL(YDL_VIDEO_OPTS) as ydl:
+            info = ydl.extract_info(url)
+            return ydl.prepare_filename(info)
+    return await asyncio.to_thread(run)
 
-# TikTok via TikMate API (gabung repo)
 async def download_tiktok(url: str) -> str:
-    url = resolve_tiktok_short(url)
+    """
+    Pakai TikWM API untuk TikTok tanpa watermark.
+    Banyak bot di GitHub pakai ini.
+    """
     try:
-        api_url = f"https://api.tikmate.app/api/lookup?url={url}"
-        res = requests.get(api_url, timeout=10).json()
-        video_url = res["video"]["url_no_watermark"]
+        # TikWM API endpoint
+        api_url = f"https://api.tikwm.com/api?url={url}"
+        res = requests.get(api_url, timeout=12).json()
+        # Cek kalau ada link video
+        video_url = res["data"]["play"] or res["data"]["play_addr"]
         file_path = "video.mp4"
         with requests.get(video_url, stream=True, timeout=30) as r:
             r.raise_for_status()
@@ -70,10 +68,12 @@ async def download_tiktok(url: str) -> str:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
         return file_path
-    except:
+    except Exception as e:
+        print("TikTok API error:", e)
         return None
 
-# ====== HANDLERS ======
+# ===== HANDLERS =====
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text.startswith("http"):
@@ -87,16 +87,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     translated = translate(caption)
     context.user_data["last_caption"] = translated
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📋 Copy Caption", callback_data="copy")],
-            [InlineKeyboardButton("⬇️ Download Video", callback_data="download")],
-        ]
-    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy Caption", callback_data="copy")],
+        [InlineKeyboardButton("⬇️ Download Video", callback_data="download")],
+    ])
 
     await update.message.reply_text(
         f"📝 CAPTION (ID):\n\n{translated[:3500]}",
-        reply_markup=keyboard,
+        reply_markup=keyboard
     )
 
 async def copy_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,20 +116,18 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "tiktok.com" in url or "vt.tiktok.com" in url:
             file_path = await download_tiktok(url)
             if not file_path:
-                await query.message.reply_text("❌ Gagal download TikTok, coba lagi nanti atau pakai link asli.")
+                await query.message.reply_text("❌ Gagal download TikTok, coba link lainnya.")
                 return
         else:
-            file_path = download_youtube(url)
-            if not file_path:
-                await query.message.reply_text("❌ Gagal download YouTube, coba lagi.")
-                return
+            file_path = await download_youtube(url)
 
         await query.message.reply_video(video=open(file_path, "rb"))
         os.remove(file_path)
     except Exception as e:
         await query.message.reply_text(f"❌ Gagal download:\n{e}")
 
-# ====== MAIN ======
+# ===== MAIN =====
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -139,7 +135,7 @@ def main():
     app.add_handler(CallbackQueryHandler(copy_caption, pattern="copy"))
     app.add_handler(CallbackQueryHandler(download_handler, pattern="download"))
 
-    print("🤖 Bot TikTok + YouTube (gabungan) GRATIS aktif...")
+    print("🤖 Bot TikTok + YouTube final siap jalan...")
     app.run_polling()
 
 if __name__ == "__main__":
